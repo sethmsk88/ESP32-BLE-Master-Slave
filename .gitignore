@@ -1,0 +1,22 @@
+# PlatformIO build files
+.pio/
+.vscode/
+
+# PlatformIO environment files
+*.ini.save
+*.ini.bak
+
+# Compiled binary files
+*.elf
+*.bin
+*.hex
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# MacOS specific files
+.DS_Store
+
+# Windows specific files
+Thumbs.db
