@@ -22,6 +22,7 @@ uint32_t localCounter = 0;
 uint32_t remoteCounter = 0;
 unsigned long lastCounterUpdate = 0;
 unsigned long lastSyncTime = 0;
+unsigned long lastScanAttempt = 0;
 String deviceName;
 
 // BLE Server components
@@ -219,7 +220,7 @@ void updateCounter() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(1000);  // Keep this one delay as it's needed for serial initialization
   
   // Generate unique device name based on MAC address
   uint64_t chipid = ESP.getEfuseMac();
@@ -236,6 +237,7 @@ void setup() {
   
   // Start scanning for other devices
   doScan = true;
+  lastScanAttempt = millis(); // Initialize scan timing
   
   Serial.println("Setup complete!");
 }
@@ -256,11 +258,11 @@ void loop() {
     }
     lastSyncTime = currentTime;
   }
-  
-  // Handle scanning and connection
+    // Handle scanning and connection
   if (doScan) {
     BLEDevice::getScan()->start(SCAN_TIME, false);
     doScan = false;
+    lastScanAttempt = currentTime;
   }
   
   // Connect to discovered device
@@ -274,11 +276,13 @@ void loop() {
   }
   
   // If not connected as client and not currently scanning, start scanning again
-  if (!clientConnected && !doScan && !doConnect) {
+  // Add a delay between scan attempts to prevent overwhelming the BLE stack
+  if (!clientConnected && !doScan && !doConnect && 
+      (currentTime - lastScanAttempt >= 3000)) { // Wait at least 3 seconds between scans
     Serial.println("Not connected, starting scan...");
     doScan = true;
-    delay(1000); // Wait a bit before scanning again
   }
   
-  delay(100); // Small delay to prevent overwhelming the system
+  // Small delay to prevent overwhelming the system (non-blocking alternative)
+  // Instead of delay(100), we just continue the loop - the timing checks above provide natural throttling
 }
