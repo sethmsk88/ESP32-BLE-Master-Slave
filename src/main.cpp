@@ -14,9 +14,14 @@
 #define TIMESTAMP_CHARACTERISTIC_UUID "f0368f9c-d3d2-4588-b033-1355ac7dc563"
 
 // Timing constants
-#define COUNTER_INTERVAL 1000  // Increment counter every 1 second
-#define SYNC_INTERVAL 5000     // Sync every 5 seconds
+#define COUNTER_INTERVAL 3000  // Increment counter every 1 second
+#define SYNC_INTERVAL 6000     // Sync every 5 seconds
 #define SCAN_TIME 3            // Scan for 3 seconds
+#define RESCAN_INTERVAL 10000  // Rescan every 10 seconds if not connected
+#define STATUS_PRINT_INTERVAL 10000 // Print status every 10 seconds
+
+// Function prototypes
+void resetConnectionState();
 
 // Global variables
 uint32_t localCounter = 0;
@@ -61,18 +66,9 @@ class MyServerCallbacks: public BLEServerCallbacks {
     };
 
     void onDisconnect(BLEServer* pServer) {
-      serverConnected = false;
       Serial.println("Server: Client disconnected");
       
-      // Reset role assignment when server connection is lost
-      // This allows for role renegotiation on reconnection
-      if (roleAssigned) {
-        Serial.println("Server: Resetting role assignment due to disconnection");
-        roleAssigned = false;
-        isMaster = false;
-        isClient = false;
-      }
-      
+      resetConnectionState();
       pServer->startAdvertising(); // Restart advertising
     }
 };
@@ -370,10 +366,19 @@ void updateCounter() {
 
 void resetConnectionState() {
   // Reset all connection-related state
+  serverConnected = false;
   clientConnected = false;
-  roleAssigned = false;
   isMaster = false;
   isClient = false;
+
+  // Reset role assignment when server connection is lost
+  // This allows for role renegotiation on reconnection
+  if (roleAssigned) {
+    Serial.println("Server: Resetting role assignment due to disconnection");
+    roleAssigned = false;
+    isMaster = false;
+    isClient = false;
+  }
   
   // Clean up client pointers
   if (pClient != nullptr) {
@@ -452,17 +457,16 @@ void loop() {
     // Debug: list all found devices
     for (int i = 0; i < deviceCount; i++) {
       BLEAdvertisedDevice device = foundDevices.getDevice(i);
-      if (device.haveServiceUUID()) {
-        Serial.printf("Device %d: %s - Has our service: %s\n", 
-                     i, 
-                     device.getAddress().toString().c_str(),
-                     device.isAdvertisingService(BLEUUID(SERVICE_UUID)) ? "YES" : "NO");
+      if (device.haveServiceUUID() && 
+          device.isAdvertisingService(BLEUUID(SERVICE_UUID))){
+        Serial.printf("Device %s - Has our service\n", i, device.getAddress().toString().c_str());
       }
     }
     
     doScan = false;
     lastScanAttempt = currentTime;
   }
+  
   // Connect to discovered device
   if (doConnect) {
     if (connectToServer()) {
@@ -475,13 +479,19 @@ void loop() {
   
   // Print status every 10 seconds
   static unsigned long lastStatusPrint = 0;
-  if (currentTime - lastStatusPrint >= 10000) {
+  if (currentTime - lastStatusPrint >= STATUS_PRINT_INTERVAL) {
     Serial.printf("Status - Role: %s, ClientConn: %s, ServerConn: %s, Counter: %d\n", 
                  roleAssigned ? (isMaster ? "MASTER" : "CLIENT") : "UNASSIGNED",
                  clientConnected ? "YES" : "NO",
                  serverConnected ? "YES" : "NO",
                  localCounter);
     lastStatusPrint = currentTime;
+  }
+  // Periodically scan for devices if not connected (neither as client nor as server)
+  if (!clientConnected && !serverConnected && !doScan && !doConnect && 
+      (currentTime - lastScanAttempt >= RESCAN_INTERVAL)) {
+    Serial.println("No connections, starting periodic scan...");
+    doScan = true;
   }
   
   // Small delay to prevent overwhelming the system (non-blocking alternative)
