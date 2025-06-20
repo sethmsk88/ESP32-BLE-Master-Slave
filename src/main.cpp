@@ -69,7 +69,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
       Serial.println("Server: Client disconnected");
       
       resetConnectionState();
-      pServer->startAdvertising(); // Restart advertising
+      // pServer->startAdvertising(); // Restart advertising
     }
 };
 
@@ -94,12 +94,22 @@ class MyClientCallback : public BLEClientCallbacks {
     
     // Clean up client connection
     if (pClient != nullptr) {
+      delete pClient; // Free the allocated memory
       pClient = nullptr;
     }
     pRemoteService = nullptr;
     pRemoteCounterCharacteristic = nullptr;
     pRemoteSyncCharacteristic = nullptr;
     pRemoteTimestampCharacteristic = nullptr;
+
+    if (targetDevice != nullptr) { // Clean up targetDevice
+        delete targetDevice;
+        targetDevice = nullptr;
+    }
+
+    // Start advertising as a server again
+    BLEDevice::startAdvertising();
+    Serial.println("Former Client: Restarting server advertising");
   }
 };
 
@@ -127,11 +137,15 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
           advertisedDevice.isAdvertisingService(BLEUUID(SERVICE_UUID))) {
         
         // Found a device with our service
-        Serial.printf("Found target device: %s\n", advertisedDevice.getAddress().toString().c_str());
+        Serial.printf("Found target device: %s\\n", advertisedDevice.getAddress().toString().c_str());
         
         // Only connect if we're not already connected as a client
         if (!clientConnected) {
           BLEDevice::getScan()->stop();
+          if (targetDevice != nullptr) { // Delete previous targetDevice if it exists
+            delete targetDevice;
+            targetDevice = nullptr;
+          }
           targetDevice = new BLEAdvertisedDevice(advertisedDevice);
           doConnect = true;
           doScan = false;
@@ -186,8 +200,8 @@ void setupBLEServer() {
   pAdvertising->setScanResponse(true);
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
-  BLEDevice::startAdvertising();
-  
+  pAdvertising->start();
+
   Serial.println("BLE Server started and advertising");
 }
 
@@ -241,7 +255,8 @@ bool connectToServer() {
     return false;
   }
   Serial.println("Found characteristics");
-    // Perform role assignment based on boot timestamps
+  
+  // Perform role assignment based on boot timestamps
   // Always perform role assignment on each connection to handle resets
   std::string remoteTimestampData = pRemoteTimestampCharacteristic->readValue();
   if (remoteTimestampData.length() == 4) {
@@ -283,6 +298,18 @@ bool connectToServer() {
   }
   
   clientConnected = true;
+  
+  if (isClient) {
+    BLEDevice::stopAdvertising();
+    serverConnected = false; // Reset server connection state
+    Serial.println("Stopped advertising as server due to client role assignment");
+  }
+  else if (isMaster) {
+    doScan = false; // Stop scanning if we are master
+    clientConnected = false; // Reset client connection state
+    Serial.println("Stopped scanning as a client due to server role assignment");
+  }
+  
   return true;
 }
 
@@ -371,13 +398,11 @@ void resetConnectionState() {
   isMaster = false;
   isClient = false;
 
-  // Reset role assignment when server connection is lost
-  // This allows for role renegotiation on reconnection
+  // Reset role assignment
   if (roleAssigned) {
-    Serial.println("Server: Resetting role assignment due to disconnection");
+    Serial.println("Connection Reset: Resetting role assignment");
     roleAssigned = false;
-    isMaster = false;
-    isClient = false;
+    // isMaster and isClient already set to false above
   }
   
   // Clean up client pointers
@@ -385,6 +410,7 @@ void resetConnectionState() {
     if (pClient->isConnected()) {
       pClient->disconnect();
     }
+    delete pClient; // Delete the client object
     pClient = nullptr;
   }
   
@@ -392,11 +418,15 @@ void resetConnectionState() {
   pRemoteCounterCharacteristic = nullptr;
   pRemoteSyncCharacteristic = nullptr;
   pRemoteTimestampCharacteristic = nullptr;
-  targetDevice = nullptr;
+  
+  if (targetDevice != nullptr) { // Delete targetDevice if it exists
+    delete targetDevice;
+    targetDevice = nullptr;
+  }
   
   // Reset flags
   doConnect = false;
-  doScan = false;
+  doScan = true; // Ensure scanning can be re-initiated by the main loop logic
   
   Serial.println("Connection state reset - ready for reconnection");
 }
@@ -444,12 +474,8 @@ void loop() {
     lastSyncTime = currentTime;
   }
   // Handle scanning and connection
-  if (doScan) {
-    Serial.printf("Starting BLE scan... (ClientConn: %s, ServerConn: %s, RoleAssigned: %s)\n",
-                 clientConnected ? "YES" : "NO",
-                 serverConnected ? "YES" : "NO", 
-                 roleAssigned ? "YES" : "NO");
-    
+  if (doScan) {    
+    Serial.println("Starting BLE scan...");
     BLEScanResults foundDevices = BLEDevice::getScan()->start(SCAN_TIME, false);
     int deviceCount = foundDevices.getCount();
     Serial.printf("Scan complete: Found %d devices\n", deviceCount);
@@ -480,7 +506,7 @@ void loop() {
   // Print status every 10 seconds
   static unsigned long lastStatusPrint = 0;
   if (currentTime - lastStatusPrint >= STATUS_PRINT_INTERVAL) {
-    Serial.printf("Status - Role: %s, ClientConn: %s, ServerConn: %s, Counter: %d\n", 
+    Serial.printf("Status - Role: %s, ClientConnToServer: %s, ServerConnToClient: %s, Counter: %d\n", 
                  roleAssigned ? (isMaster ? "MASTER" : "CLIENT") : "UNASSIGNED",
                  clientConnected ? "YES" : "NO",
                  serverConnected ? "YES" : "NO",
