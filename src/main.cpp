@@ -288,7 +288,8 @@ bool connectToServer() {
         isClient = true;
         Serial.println("ROLE: This device is CLIENT (MAC address tiebreaker)");
       }
-    }    roleAssigned = true;
+    }
+    roleAssigned = true;
   } else {
     Serial.println("Failed to read remote timestamp");
     pClient->disconnect();
@@ -296,11 +297,10 @@ bool connectToServer() {
     pClient = nullptr;
     return false;
   }
-  
-  clientConnected = true;
-  
+    
   if (isClient) {
     BLEDevice::stopAdvertising();
+    clientConnected = true;
     serverConnected = false; // Reset server connection state
     Serial.println("Stopped advertising as server due to client role assignment");
   }
