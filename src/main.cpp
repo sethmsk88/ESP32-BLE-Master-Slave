@@ -6,6 +6,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLE2902.h>
+#include <stdlib.h> // For random
 
 // Service and Characteristic UUIDs for counter synchronization
 #define SERVICE_UUID "21e862dc-87da-4130-9991-2a5a49b4d949"
@@ -56,20 +57,49 @@ bool serverConnected = false;
 bool clientConnected = false;
 bool doConnect = false;
 bool doScan = false;
+bool doRoleNegotiation = false;
+unsigned long connectAttemptStartTime = 0;
+#define CONNECTION_TIMEOUT 10000  // 10 second timeout for connection attempts
 BLEAdvertisedDevice* targetDevice = nullptr;
+
+// Add a random delay (0-1000ms) before scanning/connecting after disconnect
+unsigned long randomScanDelay = 0;
+unsigned long scanDelayStart = 0;
 
 // Server callbacks
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       serverConnected = true;
       Serial.println("Server: Client connected");
+      
+      // Update timestamp characteristic with current uptime for role negotiation
+      uint32_t currentUptime = millis();
+      pTimestampCharacteristic->setValue((uint8_t*)&currentUptime, 4);
+      
+      // Trigger role negotiation when a client connects
+      // We'll do this in the main loop to avoid blocking the callback
+      doRoleNegotiation = true;
     };
 
     void onDisconnect(BLEServer* pServer) {
       Serial.println("Server: Client disconnected");
+      serverConnected = false;
       
-      resetConnectionState();
-      // pServer->startAdvertising(); // Restart advertising
+      // If we were in a master role and lost the client connection,
+      // we need to reset and be ready to reconnect
+      if (roleAssigned && isMaster) {
+        Serial.println("Server: Master lost client, resetting roles and restarting advertising");
+        roleAssigned = false;
+        isMaster = false;
+        isClient = false;
+        // Instead of scanning immediately, set a random delay
+        randomScanDelay = random(200, 1200); // 200-1200ms
+        scanDelayStart = millis();
+      }
+      
+      // Always restart advertising when a client disconnects
+      pServer->startAdvertising();
+      Serial.println("Server: Restarted advertising after client disconnect");
     }
 };
 
@@ -84,32 +114,32 @@ class MyClientCallback : public BLEClientCallbacks {
     Serial.println("Client: Disconnected from server");
     
     // Reset role assignment when client connection is lost
-    // This allows for role renegotiation on reconnection
     if (roleAssigned) {
       Serial.println("Client: Resetting role assignment due to disconnection");
       roleAssigned = false;
       isMaster = false;
       isClient = false;
+      // Instead of scanning immediately, set a random delay
+      randomScanDelay = random(200, 1200); // 200-1200ms
+      scanDelayStart = millis();
     }
     
-    // Clean up client connection
-    if (pClient != nullptr) {
-      delete pClient; // Free the allocated memory
-      pClient = nullptr;
-    }
+    // Clean up remote service pointers
     pRemoteService = nullptr;
     pRemoteCounterCharacteristic = nullptr;
     pRemoteSyncCharacteristic = nullptr;
     pRemoteTimestampCharacteristic = nullptr;
 
-    if (targetDevice != nullptr) { // Clean up targetDevice
+    // Clean up target device
+    if (targetDevice != nullptr) {
         delete targetDevice;
         targetDevice = nullptr;
     }
 
-    // Start advertising as a server again
+    // Start advertising as a server again and begin scanning
     BLEDevice::startAdvertising();
-    Serial.println("Former Client: Restarting server advertising");
+    // doScan = true; // REMOVE this line, scanning will be triggered after delay
+    Serial.println("Client: Restarted server advertising and scanning after disconnect");
   }
 };
 
@@ -137,20 +167,31 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
           advertisedDevice.isAdvertisingService(BLEUUID(SERVICE_UUID))) {
         
         // Found a device with our service
-        Serial.printf("Found target device: %s\\n", advertisedDevice.getAddress().toString().c_str());
+        Serial.printf("Found target device: %s\n", advertisedDevice.getAddress().toString().c_str());
         
-        // Only connect if we're not already connected as a client
-        if (!clientConnected) {
+        // Connect if we're not already connected as a client
+        // OR if we have a server connection but no role assigned (need negotiation)
+        if (!clientConnected || (serverConnected && !roleAssigned)) {
           BLEDevice::getScan()->stop();
-          if (targetDevice != nullptr) { // Delete previous targetDevice if it exists
+          if (targetDevice != nullptr) {
             delete targetDevice;
             targetDevice = nullptr;
           }
           targetDevice = new BLEAdvertisedDevice(advertisedDevice);
+          
+          // Add a small delay based on MAC address to prevent connection collisions
+          // Device with "smaller" MAC address waits a bit longer to avoid both connecting simultaneously
+          String localMac = BLEDevice::getAddress().toString().c_str();
+          String remoteMac = advertisedDevice.getAddress().toString().c_str();
+          if (localMac < remoteMac) {
+            Serial.println("Delaying connection to avoid collision (smaller MAC)");
+            delay(1000); // Wait 1 second if we have smaller MAC
+          }
+          
           doConnect = true;
           doScan = false;
         } else {
-          Serial.println("Already connected as client, ignoring found device");
+          Serial.println("Already properly connected, ignoring found device");
         }
       }
     }
@@ -181,12 +222,12 @@ void setupBLEServer() {
     TIMESTAMP_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ
   );
-  
-  // Set sync callback
+    // Set sync callback
   pSyncCharacteristic->setCallbacks(new MySyncCallback());
   
-  // Set boot timestamp in characteristic
-  pTimestampCharacteristic->setValue((uint8_t*)&bootTimestamp, 4);
+  // Set initial uptime in timestamp characteristic
+  uint32_t initialUptime = millis();
+  pTimestampCharacteristic->setValue((uint8_t*)&initialUptime, 4);
   
   // Add descriptors for notifications
   pCounterCharacteristic->addDescriptor(new BLE2902());
@@ -217,33 +258,71 @@ void setupBLEClient() {
   Serial.println("BLE Client scanner configured");
 }
 
+void performRoleNegotiation() {
+  // Only perform role negotiation if we have a server connection but no assigned role
+  if (!serverConnected || roleAssigned) {
+    return;
+  }
+  
+  Serial.println("Server: Connected without role assignment, forcing disconnection for proper negotiation");
+  
+  // Force disconnection to restart the connection process with proper role negotiation
+  if (pServer != nullptr) {
+    pServer->disconnect(0);
+  }
+  
+  // Reset states and start scanning
+  serverConnected = false;
+  roleAssigned = false;
+  isMaster = false;
+  isClient = false;
+  doScan = true;
+  
+  Serial.println("Server: Forced disconnect complete, will scan for proper reconnection");
+}
+
 bool connectToServer() {
   Serial.printf("Attempting to connect to %s\n", targetDevice->getAddress().toString().c_str());
   
-  pClient = BLEDevice::createClient();
+  // Clean up any existing client
+  if (pClient != nullptr) {
+    if (pClient->isConnected()) {
+      pClient->disconnect();
+    }
+    delete pClient;
+    pClient = nullptr;
+  }
+    pClient = BLEDevice::createClient();
   pClient->setClientCallbacks(new MyClientCallback());
   
   // Connect to remote BLE server with timeout handling
+  Serial.println("Connecting to server...");
   if (!pClient->connect(targetDevice)) {
-    Serial.println("Failed to connect to server");
+    Serial.println("Failed to connect to server - connection timeout or refused");
     delete pClient;
     pClient = nullptr;
+    // Reset flags to allow retry
+    doConnect = false;
+    doScan = true;
     return false;
   }
   Serial.println("Connected to server");
-  
-  // Obtain reference to service
+    // Obtain reference to service
+  Serial.println("Getting service...");
   pRemoteService = pClient->getService(SERVICE_UUID);
   if (pRemoteService == nullptr) {
     Serial.println("Failed to find service UUID");
     pClient->disconnect();
     delete pClient;
     pClient = nullptr;
+    doConnect = false;
+    doScan = true;
     return false;
   }
   Serial.println("Found service");
   
   // Obtain references to characteristics
+  Serial.println("Getting characteristics...");
   pRemoteCounterCharacteristic = pRemoteService->getCharacteristic(COUNTER_CHARACTERISTIC_UUID);
   pRemoteSyncCharacteristic = pRemoteService->getCharacteristic(SYNC_CHARACTERISTIC_UUID);
   pRemoteTimestampCharacteristic = pRemoteService->getCharacteristic(TIMESTAMP_CHARACTERISTIC_UUID);
@@ -252,29 +331,32 @@ bool connectToServer() {
     pClient->disconnect();
     delete pClient;
     pClient = nullptr;
+    doConnect = false;
+    doScan = true;
     return false;
   }
-  Serial.println("Found characteristics");
-  
-  // Perform role assignment based on boot timestamps
-  // Always perform role assignment on each connection to handle resets
+  Serial.println("Found characteristics");    // Perform role assignment based on current uptime
+  // Device with longer uptime (larger value) becomes master
+  Serial.println("Reading remote timestamp...");
   std::string remoteTimestampData = pRemoteTimestampCharacteristic->readValue();
   if (remoteTimestampData.length() == 4) {
-    uint32_t remoteBootTimestamp;
-    memcpy(&remoteBootTimestamp, remoteTimestampData.data(), 4);
+    uint32_t remoteUptime;
+    memcpy(&remoteUptime, remoteTimestampData.data(), 4);
     
-    Serial.printf("Local boot timestamp: %lu\n", bootTimestamp);
-    Serial.printf("Remote boot timestamp: %lu\n", remoteBootTimestamp);
+    // Calculate current uptime for comparison
+    uint32_t currentUptime = millis();
     
-    // Device with earlier (lower) boot timestamp becomes master
-    if (bootTimestamp < remoteBootTimestamp) {
+    Serial.printf("Local uptime: %lu\n", currentUptime);
+    Serial.printf("Remote uptime: %lu\n", remoteUptime);
+      // Device with later (higher) boot timestamp becomes master (longer running time)
+    if (currentUptime > remoteUptime) {
       isMaster = true;
       isClient = false;
-      Serial.println("ROLE: This device is MASTER (earlier boot time)");
-    } else if (bootTimestamp > remoteBootTimestamp) {
+      Serial.println("ROLE: This device is MASTER (later boot time - been running longer)");
+    } else if (currentUptime < remoteUptime) {
       isMaster = false;
       isClient = true;
-      Serial.println("ROLE: This device is CLIENT (later boot time)");
+      Serial.println("ROLE: This device is CLIENT (earlier boot time - just rebooted)");
     } else {
       // Same timestamp (very unlikely), use MAC address as tiebreaker
       String localMac = BLEDevice::getAddress().toString().c_str();
@@ -295,6 +377,8 @@ bool connectToServer() {
     pClient->disconnect();
     delete pClient;
     pClient = nullptr;
+    doConnect = false;
+    doScan = true;
     return false;
   }
     
@@ -303,11 +387,19 @@ bool connectToServer() {
     clientConnected = true;
     serverConnected = false; // Reset server connection state
     Serial.println("Stopped advertising as server due to client role assignment");
+    // Stop scanning as client if role assigned
+    BLEDevice::getScan()->stop();
+    doScan = false;
   }
   else if (isMaster) {
     doScan = false; // Stop scanning if we are master
     clientConnected = false; // Reset client connection state
-    Serial.println("Stopped scanning as a client due to server role assignment");
+    // Stop all client activities if we are master
+    BLEDevice::getScan()->stop();
+    doConnect = false;
+    Serial.println("Stopped scanning and connecting as a client due to server role assignment");
+    // Ensure advertising is running as master
+    BLEDevice::startAdvertising();
   }
   
   return true;
@@ -392,41 +484,44 @@ void updateCounter() {
 }
 
 void resetConnectionState() {
-  // Reset all connection-related state
-  serverConnected = false;
-  clientConnected = false;
-  isMaster = false;
-  isClient = false;
-
-  // Reset role assignment
-  if (roleAssigned) {
-    Serial.println("Connection Reset: Resetting role assignment");
-    roleAssigned = false;
-    // isMaster and isClient already set to false above
-  }
+  Serial.println("Connection Reset: Cleaning up connection state");
   
-  // Clean up client pointers
+  // Clean up client connection if it exists
   if (pClient != nullptr) {
     if (pClient->isConnected()) {
       pClient->disconnect();
     }
-    delete pClient; // Delete the client object
+    delete pClient;
     pClient = nullptr;
   }
   
+  // Reset remote service pointers
   pRemoteService = nullptr;
   pRemoteCounterCharacteristic = nullptr;
   pRemoteSyncCharacteristic = nullptr;
   pRemoteTimestampCharacteristic = nullptr;
   
-  if (targetDevice != nullptr) { // Delete targetDevice if it exists
+  // Clean up target device
+  if (targetDevice != nullptr) {
     delete targetDevice;
     targetDevice = nullptr;
   }
   
-  // Reset flags
+  // Reset connection flags
+  clientConnected = false;
   doConnect = false;
-  doScan = true; // Ensure scanning can be re-initiated by the main loop logic
+  
+  // Reset role assignment to allow renegotiation
+  if (roleAssigned) {
+    Serial.println("Connection Reset: Resetting role assignment");
+    roleAssigned = false;
+    isMaster = false;
+    isClient = false;
+  }
+  
+  // Restart advertising and scanning
+  BLEDevice::startAdvertising();
+  doScan = true;
   
   Serial.println("Connection state reset - ready for reconnection");
 }
@@ -438,7 +533,9 @@ void setup() {
   // Generate unique device name and boot timestamp
   uint64_t chipid = ESP.getEfuseMac();
   deviceName = "ESP32Counter_" + String((uint16_t)(chipid >> 32), HEX);
-  bootTimestamp = millis(); // Initialize boot timestamp
+    // Use a combination of chip ID and current uptime for role negotiation
+  // Higher uptime = device has been running longer = should be master
+  bootTimestamp = millis();
   
   Serial.printf("Starting %s...\n", deviceName.c_str());
   Serial.printf("Boot timestamp: %lu\n", bootTimestamp);
@@ -454,11 +551,19 @@ void setup() {
   doScan = true;
   lastScanAttempt = millis(); // Initialize scan timing
   
+  randomSeed(esp_random()); // Seed random for delay
+  
   Serial.println("Setup complete!");
 }
 
 void loop() {
   unsigned long currentTime = millis();
+  
+  // Handle role negotiation when server gets a connection without assigned roles
+  if (doRoleNegotiation) {
+    performRoleNegotiation();
+    doRoleNegotiation = false;
+  }
   
   // Update counter every second
   if (currentTime - lastCounterUpdate >= COUNTER_INTERVAL) {
@@ -472,8 +577,7 @@ void loop() {
       performSync();
     }
     lastSyncTime = currentTime;
-  }
-  // Handle scanning and connection
+  }  // Handle scanning and connection
   if (doScan) {    
     Serial.println("Starting BLE scan...");
     BLEScanResults foundDevices = BLEDevice::getScan()->start(SCAN_TIME, false);
@@ -485,39 +589,69 @@ void loop() {
       BLEAdvertisedDevice device = foundDevices.getDevice(i);
       if (device.haveServiceUUID() && 
           device.isAdvertisingService(BLEUUID(SERVICE_UUID))){
-        Serial.printf("Device %s - Has our service\n", i, device.getAddress().toString().c_str());
+        Serial.printf("Device %d: %s - Has our service\n", i, device.getAddress().toString().c_str());
       }
     }
     
     doScan = false;
     lastScanAttempt = currentTime;
   }
-  
-  // Connect to discovered device
+    // Connect to discovered device
   if (doConnect) {
-    if (connectToServer()) {
-      Serial.println("Successfully connected to server and role assigned");
-    } else {
-      Serial.println("Failed to connect to server or assign role");
+    if (connectAttemptStartTime == 0) {
+      connectAttemptStartTime = currentTime;
+      Serial.println("Starting connection attempt...");
     }
-    doConnect = false;
+    
+    // Check for connection timeout
+    if (currentTime - connectAttemptStartTime > CONNECTION_TIMEOUT) {
+      Serial.println("Connection attempt timed out, resetting...");
+      doConnect = false;
+      connectAttemptStartTime = 0;
+      doScan = true;
+      
+      // Clean up
+      if (targetDevice != nullptr) {
+        delete targetDevice;
+        targetDevice = nullptr;
+      }
+    } else {
+      // Attempt connection
+      if (connectToServer()) {
+        Serial.println("Successfully connected to server and role assigned");
+        connectAttemptStartTime = 0;
+      } else {
+        Serial.println("Failed to connect to server or assign role");
+        connectAttemptStartTime = 0;
+      }
+      doConnect = false;
+    }
   }
-  
-  // Print status every 10 seconds
+    // Print status every 10 seconds
   static unsigned long lastStatusPrint = 0;
   if (currentTime - lastStatusPrint >= STATUS_PRINT_INTERVAL) {
-    Serial.printf("Status - Role: %s, ClientConnToServer: %s, ServerConnToClient: %s, Counter: %d\n", 
+    Serial.printf("Status - Role: %s, ClientConnToServer: %s, ServerConnToClient: %s, Counter: %d, doConnect: %s, doScan: %s\n", 
                  roleAssigned ? (isMaster ? "MASTER" : "CLIENT") : "UNASSIGNED",
                  clientConnected ? "YES" : "NO",
                  serverConnected ? "YES" : "NO",
-                 localCounter);
+                 localCounter,
+                 doConnect ? "YES" : "NO",
+                 doScan ? "YES" : "NO");
     lastStatusPrint = currentTime;
+  }// Periodically scan for devices if not connected or role not assigned
+  if ((!clientConnected && !serverConnected) || !roleAssigned) {
+    if (!doScan && !doConnect && (currentTime - lastScanAttempt >= RESCAN_INTERVAL)) {
+      Serial.println("No proper connection/role, starting periodic scan...");
+      doScan = true;
+    }
   }
-  // Periodically scan for devices if not connected (neither as client nor as server)
-  if (!clientConnected && !serverConnected && !doScan && !doConnect && 
-      (currentTime - lastScanAttempt >= RESCAN_INTERVAL)) {
-    Serial.println("No connections, starting periodic scan...");
+  
+  // Handle random scan delay after disconnect
+  if (randomScanDelay > 0 && (currentTime - scanDelayStart >= randomScanDelay)) {
     doScan = true;
+    randomScanDelay = 0;
+    scanDelayStart = 0;
+    Serial.println("Randomized delay complete, starting scan.");
   }
   
   // Small delay to prevent overwhelming the system (non-blocking alternative)
