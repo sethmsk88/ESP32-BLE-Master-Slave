@@ -16,10 +16,10 @@
 
 // Timing constants
 #define COUNTER_INTERVAL 3000  // Increment counter every 1 second
-#define SYNC_INTERVAL 6000     // Sync every 5 seconds
+#define SYNC_INTERVAL 10000     // Sync every 10 seconds
 #define SCAN_TIME 3            // Scan for 3 seconds
 #define RESCAN_INTERVAL 10000  // Rescan every 10 seconds if not connected
-#define STATUS_PRINT_INTERVAL 10000 // Print status every 10 seconds
+#define STATUS_PRINT_INTERVAL 20000 // Print status every 20 seconds
 
 // Function prototypes
 void resetConnectionState();
@@ -147,16 +147,30 @@ class MyClientCallback : public BLEClientCallbacks {
 class MySyncCallback: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) {
       std::string value = pCharacteristic->getValue();
-      if (value.length() == 4) {
-        uint32_t receivedCounter;
-        memcpy(&receivedCounter, value.data(), 4);
-        
-        // Sync logic: use the higher counter value
-        if (receivedCounter > localCounter) {
-          localCounter = receivedCounter;
-          Serial.printf("Sync: Updated local counter to %d\n", localCounter);
-        }
-      }
+      
+      // Timing sync packet format
+      struct {
+        uint32_t counter;
+        uint32_t timeSinceLastUpdate;
+      } syncPacket;
+      
+      memcpy(&syncPacket, value.data(), 8);
+      
+      // Sync logic: use the received counter value and timing
+      localCounter = syncPacket.counter;
+      
+      // Calculate timing adjustment using relative timing (avoids clock drift issues)
+      unsigned long currentTime = millis();
+      unsigned long masterTimeSinceUpdate = syncPacket.timeSinceLastUpdate;
+      
+      // Adjust our timing to sync with master's cycle
+      // Set our lastCounterUpdate so that our next increment happens at the same relative time
+      lastCounterUpdate = currentTime - masterTimeSinceUpdate;
+      
+      Serial.printf("Timing Sync: Counter=%d, MasterTimeSinceUpdate=%lu, Current=%lu\n", 
+                    syncPacket.counter, masterTimeSinceUpdate, currentTime);
+      Serial.printf("Timing Sync: Set lastCounterUpdate to %lu (next increment in %lu ms)\n", 
+                    lastCounterUpdate, COUNTER_INTERVAL - masterTimeSinceUpdate);
     }
 };
 
@@ -390,10 +404,9 @@ bool connectToServer() {
     // Stop scanning as client if role assigned
     BLEDevice::getScan()->stop();
     doScan = false;
-  }
-  else if (isMaster) {
+  }  else if (isMaster) {
     doScan = false; // Stop scanning if we are master
-    clientConnected = false; // Reset client connection state
+    clientConnected = true; // Keep client connection for sync operations
     // Stop all client activities if we are master
     BLEDevice::getScan()->stop();
     doConnect = false;
@@ -408,31 +421,19 @@ bool connectToServer() {
 void performSync() {
   if (clientConnected && pRemoteSyncCharacteristic != nullptr && roleAssigned) {
     if (isMaster) {
-      // Master behavior: read remote counter and update it if necessary
-      std::string value = pRemoteCounterCharacteristic->readValue();
-      if (value.length() == 4) {
-        memcpy(&remoteCounter, value.data(), 4);
-        Serial.printf("Master sync - Remote: %d, Local: %d\n", remoteCounter, localCounter);
-        
-        // Master dictates the counter value - use the higher one
-        uint32_t syncValue = max(localCounter, remoteCounter);
-        if (syncValue != remoteCounter) {
-          // Write the sync value to remote device
-          pRemoteSyncCharacteristic->writeValue((uint8_t*)&syncValue, 4);
-          Serial.printf("Master: Synced remote counter to %d\n", syncValue);
-        }
-        
-        // Update local counter if remote was higher
-        if (syncValue != localCounter) {
-          localCounter = syncValue;
-          Serial.printf("Master: Updated local counter to %d\n", localCounter);
-          // Update server characteristic
-          pCounterCharacteristic->setValue((uint8_t*)&localCounter, 4);
-          if (serverConnected) {
-            pCounterCharacteristic->notify();
-          }
-        }
-      }
+      // Master behavior: send counter and time since last update
+      struct {
+        uint32_t counter;
+        uint32_t timeSinceLastUpdate;
+      } syncPacket;
+      
+      syncPacket.counter = localCounter;
+      syncPacket.timeSinceLastUpdate = millis() - lastCounterUpdate; // Time elapsed since last counter increment
+      
+      // Write the sync packet to remote device
+      pRemoteSyncCharacteristic->writeValue((uint8_t*)&syncPacket, sizeof(syncPacket));
+      Serial.printf("Master: Sent timing sync - Counter: %d, TimeSinceUpdate: %lu\n", syncPacket.counter, syncPacket.timeSinceLastUpdate);
+      
     } else if (isClient) {
       // Client behavior: just read master's counter and report
       std::string value = pRemoteCounterCharacteristic->readValue();
